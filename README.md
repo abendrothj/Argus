@@ -9,6 +9,7 @@ Argus is a simple file integrity checker built in Rust. It recursively scans a g
 - Calculate the SHA-256 checksum of each file.
 - Output results in NDJSON format for easy processing.
 - Supports command-line arguments for custom input and output paths.
+- Other features are WIP
 
 ## Requirements
 
@@ -83,7 +84,7 @@ To contribute to this project:
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the GPLv3 License. See the [LICENSE](LICENSE) file for details.
 
 ---
 
