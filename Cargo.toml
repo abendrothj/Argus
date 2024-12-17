@@ -1,0 +1,11 @@
+[package]
+name = "argus"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha2 = "0.10"         # For SHA-256 hashing
+walkdir = "2.4"       # For recursive directory traversal
+serde = { version = "1.0", features = ["derive"] }  # For JSON serialization/deserialization
+serde_json = "1.0"    # To work with JSON files
+clap = { version = "4.0", features = ["derive"] }   # Command-line options
