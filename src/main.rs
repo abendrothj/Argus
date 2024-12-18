@@ -3,7 +3,8 @@ use walkdir::WalkDir;
 use serde::{Serialize, Deserialize};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use clap::{Arg, Command};
+use std::path::Path;
+use clap::{value_parser, Arg, Command};
 
 #[derive(Serialize, Deserialize)]
 struct FileRecord {
@@ -63,7 +64,8 @@ fn main() -> io::Result<()> {
                 .long("directory")
                 .value_name("DIR")
                 .help("The directory to scan")
-                .default_value("./"), // Default is the current directory
+                .default_value("./") // Default is the current directory
+                .value_parser(directory_checker),
         )
         .arg(
             Arg::new("output")
@@ -90,4 +92,18 @@ fn main() -> io::Result<()> {
     println!("Integrity data saved to {}", output_file);
 
     Ok(())
+}
+
+fn directory_checker(s: &str) -> Result<String, String> {
+    let path = Path::new(s);
+    if !path.exists() {
+        return Err("Directory doesn't exist".into());
+    }
+    else if !path.is_dir() {
+        return Err("Path does not point at a directory.".into());
+    }
+    else if path.read_dir().is_err() {
+        return Err("Directory not readable, could be because of permissions.".into());
+    }
+    Ok(s.to_string())
 }
