@@ -55,7 +55,7 @@ fn main() -> io::Result<()> {
     // Set up command-line argument parsing using clap (4.x version)
     let matches = Command::new("File Integrity Checker")
         .version("1.0")
-        .author("Your Name <your-email@example.com>")
+        .author("Jake Abendroth <will-put-email-later>")
         .about("Scans files in a directory and saves their checksums in NDJSON format")
         .arg(
             Arg::new("directory")
