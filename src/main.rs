@@ -1,10 +1,11 @@
+use std::env::current_dir;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 use serde::{Serialize, Deserialize};
-use std::fs::{File, OpenOptions};
+use std::fs::{canonicalize, create_dir_all, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
-use clap::{value_parser, Arg, Command};
+use clap::{Arg, Command};
 
 #[derive(Serialize, Deserialize)]
 struct FileRecord {
@@ -25,14 +26,20 @@ fn calculate_checksum(path: &str) -> io::Result<String> {
 fn scan_directory(dir: &str) -> io::Result<Vec<FileRecord>> {
     let mut records = Vec::new();
 
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir).follow_links(false).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_file() {
-            let path_str = path.to_string_lossy().to_string();
-            println!("Processing: {}", path_str);
-            match calculate_checksum(&path_str) {
-                Ok(checksum) => records.push(FileRecord { path: path_str, checksum }),
-                Err(e) => eprintln!("Failed to process {}: {}", path_str, e),
+            match canonicalize(path) {
+                Ok(abs_path) => {
+                    let abs_path_str = abs_path.to_string_lossy().to_string();
+                    println!("Processing file: {}", abs_path_str);
+
+                    match calculate_checksum(&abs_path_str) {
+                        Ok(checksum) => records.push(FileRecord { path: abs_path_str, checksum }),
+                        Err(e) => println!("Error while processing file: {}\n{}", abs_path_str, e),
+                    }
+                }
+                Err(e) => eprintln!("Couldn't get absolute path for {}: {}", path.display(), e),
             }
         }
     }
@@ -73,7 +80,8 @@ fn main() -> io::Result<()> {
                 .long("output")
                 .value_name("FILE")
                 .help("The output file to save the checksums")
-                .default_value("file_integrity.ndjson"), // Default output file
+                .default_value("file_integrity.ndjson")
+                .value_parser(output_file_checker),
         )
         .get_matches();
 
@@ -106,4 +114,36 @@ fn directory_checker(s: &str) -> Result<String, String> {
         return Err("Directory not readable, could be because of permissions.".into());
     }
     Ok(s.to_string())
+}
+fn output_file_checker(val: &str) -> Result<String, String> {
+    let path = Path::new(val);
+    let mut full_path = path.to_path_buf();
+
+    // If the path is relative, use the current directory as the base
+    if !path.is_absolute() {
+        if let Ok(current_dir) = current_dir() {
+            full_path = current_dir.join(path);
+        } else {
+            return Err("Could not determine the current working directory.".into());
+        }
+    }
+    if let Some(parent_dir) = full_path.parent() {
+        // If specified location is in folders that don't exist, we will create them
+        if parent_dir != Path::new("/") {
+            if let Err(e) = create_dir_all(parent_dir) {
+                return Err(format!("Failed to create directory {}: {}", parent_dir.display(), e));
+            }
+        }
+    }
+
+    // Try to create or open the file (in append mode)
+    if let Err(e) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&full_path)
+    {
+        return Err(format!("Failed to open output file '{}': {}", full_path.display(), e));
+    }
+
+    Ok(val.to_string())
 }
