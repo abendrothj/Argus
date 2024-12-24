@@ -5,14 +5,69 @@ use serde::{Serialize, Deserialize};
 use std::fs::{canonicalize, create_dir_all, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
+use tokio::sync::mpsc;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind};
 
 #[derive(Serialize, Deserialize)]
 struct FileRecord {
     path: String,
     checksum: String,
 }
+async fn start_monitoring(directory: &str) -> notify::Result<()> {
+    let (tx, mut rx) = mpsc::channel(100);
+    let mut watcher = RecommendedWatcher::new(move |res| {
+        let _ = tx.blocking_send(res);
+    }, Default::default())?;
+    watcher.watch(Path::new(directory), RecursiveMode::Recursive)?;
 
+    println!("Started watching directory {}", directory);
+    while let Some(res) = rx.recv().await {
+        match res {
+            Ok(event) => handle_event(event),
+            Err(e) => println!("watch error: {:?}", e),
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_event(event: Event) {
+    println!("Event detected: {:?}", event);
+
+    for path in &event.paths {
+        match &event.kind {
+            EventKind::Modify(modification) => {
+                match modification {
+                    notify::event::ModifyKind::Data(_) => {
+                        println!("Data modified: {}", path.display());
+                    }
+                    notify::event::ModifyKind::Metadata(_) => {
+                        println!("Metadata modified: {}", path.display());
+                    }
+                    notify::event::ModifyKind::Name(_) => {
+                        println!("Name modified: {}", path.display());
+                    }
+                    _ => {
+                        println!("Other modification: {:?}", event);
+                    }
+                }
+            }
+            EventKind::Create(_) => {
+                println!("File created: {}", path.display());
+            }
+            EventKind::Remove(_) => {
+                println!("File removed: {}", path.display());
+            }
+            EventKind::Access(_) => {
+                println!("File access: {}", path.display());
+            }
+            _ => {
+                println!("Other event detected: {:?}", event);
+            }
+        }
+    }
+}
 fn calculate_checksum(path: &str) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -58,8 +113,8 @@ fn save_to_ndjson(record: &FileRecord, output: &str) -> io::Result<()> {
     writeln!(file, "{}", json_string)?; // Write the JSON string followed by a newline
     Ok(())
 }
-
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     // Set up command-line argument parsing using clap (4.x version)
     let matches = Command::new("File Integrity Checker")
         .version("1.0")
@@ -83,25 +138,42 @@ fn main() -> io::Result<()> {
                 .default_value("file_integrity.ndjson")
                 .value_parser(output_file_checker),
         )
+        .arg(
+            Arg::new("monitor")
+                .short('m')
+                .long("monitor")
+                .help("Enables monitoring on the given directory.")
+                .action(ArgAction::SetTrue),
+        )
         .get_matches();
 
     // Get values from the command-line arguments
     let directory = matches.get_one::<String>("directory").unwrap();
     let output_file = matches.get_one::<String>("output").unwrap();
+    let monitor_mode = matches.get_flag("monitor");
 
-    println!("Scanning directory: {}", directory);
-    let records = scan_directory(directory)?;
+    if monitor_mode {
+        println!("Monitoring directory: {}", directory);
+        if let Err(e) = start_monitoring(directory).await {
+            eprintln!("Couldn't start monitoring: {}", e);
+        }
+    } else {
+        println!("Scanning directory: {}", directory);
+        let records = scan_directory(directory)?;
 
-    // Loop through all records and append each one to the file
-    for record in records {
-        save_to_ndjson(&record, output_file)?;
+        for record in records {
+            save_to_ndjson(&record, output_file)?;
+        }
+
+        println!("Integrity data saved to {}", output_file);
     }
-
-    println!("Integrity data saved to {}", output_file);
 
     Ok(())
 }
 
+//
+// Value_Parser functions
+//
 fn directory_checker(s: &str) -> Result<String, String> {
     let path = Path::new(s);
     if !path.exists() {
