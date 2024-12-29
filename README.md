@@ -14,7 +14,6 @@ Argus is a simple file integrity checker built in Rust. It recursively scans a g
 #### Coming soon:
 
 - Checking against old checksums for changes (WIP)
-- Multi-threading
 - Automation?
 
 ## Requirements
