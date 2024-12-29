@@ -1,5 +1,5 @@
 
-# Argus - File Integrity Checker
+# Argus - Directory Checksum/Monitoring Tool
 
 Argus is a simple file integrity checker built in Rust. It recursively scans a given directory, calculates the SHA-256 checksum for each file, and stores the results in a file. It supports output in NDJSON (Newline Delimited JSON) format.
 
