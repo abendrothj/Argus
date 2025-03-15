@@ -8,11 +8,44 @@ use std::path::Path;
 use clap::{Arg, ArgAction, Command};
 use tokio::sync::mpsc;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct FileRecord {
     path: String,
     checksum: String,
+    timestamp: u64,
+    size: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ComparisonResult {
+    added_files: Vec<FileRecord>,
+    removed_files: Vec<FileRecord>,
+    modified_files: Vec<FileChange>,
+    stats: ComparisonStats,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FileChange {
+    path: String,
+    old_checksum: String,
+    new_checksum: String,
+    old_timestamp: u64,
+    new_timestamp: u64,
+    old_size: u64,
+    new_size: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ComparisonStats {
+    total_files_old: usize,
+    total_files_new: usize,
+    files_added: usize,
+    files_removed: usize,
+    files_modified: usize,
+    total_size_change: i64,
 }
 
 async fn start_monitoring(directory: &str) -> notify::Result<()> {
@@ -90,8 +123,20 @@ fn scan_directory(dir: &str) -> io::Result<Vec<FileRecord>> {
                     let abs_path_str = abs_path.to_string_lossy().to_string();
                     println!("Processing file: {}", abs_path_str);
 
+                    let metadata = entry.metadata()?;
+                    let timestamp = metadata.modified()
+                        .unwrap_or(UNIX_EPOCH)
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
                     match calculate_checksum(&abs_path_str) {
-                        Ok(checksum) => records.push(FileRecord { path: abs_path_str, checksum }),
+                        Ok(checksum) => records.push(FileRecord {
+                            path: abs_path_str,
+                            checksum,
+                            timestamp,
+                            size: metadata.len(),
+                        }),
                         Err(e) => println!("Error while processing file: {}\n{}", abs_path_str, e),
                     }
                 }
@@ -103,8 +148,14 @@ fn scan_directory(dir: &str) -> io::Result<Vec<FileRecord>> {
     Ok(records)
 }
 
-fn compare_with_existing(file_path: &Path, new_records: &[FileRecord]) -> io::Result<()> {
-    let file = File::open(file_path).map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("Failed to open compare file {}: {}", file_path.display(), e)))?;
+fn compare_with_existing(file_path: &Path, new_records: &[FileRecord]) -> io::Result<ComparisonResult> {
+    let file = File::open(file_path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Failed to open compare file {}: {}", file_path.display(), e)
+        )
+    })?;
+
     let mut existing_records = Vec::new();
     for line in io::BufReader::new(file).lines() {
         if let Ok(record_line) = line {
@@ -114,27 +165,110 @@ fn compare_with_existing(file_path: &Path, new_records: &[FileRecord]) -> io::Re
         }
     }
 
+    // Create maps for faster lookup
+    let existing_map: HashMap<_, _> = existing_records.iter()
+        .map(|r| (&r.path, r))
+        .collect();
+    let new_map: HashMap<_, _> = new_records.iter()
+        .map(|r| (&r.path, r))
+        .collect();
+
+    let mut added_files = Vec::new();
+    let mut removed_files = Vec::new();
+    let mut modified_files = Vec::new();
+    let mut total_size_change: i64 = 0;
+
+    // Find added and modified files
     for new_record in new_records {
-        if let Some(existing) = existing_records.iter().find(|r| r.path == new_record.path) {
-            if existing.checksum != new_record.checksum {
-                println!("File changed: {}", new_record.path);
+        match existing_map.get(&new_record.path) {
+            Some(existing) => {
+                if existing.checksum != new_record.checksum {
+                    modified_files.push(FileChange {
+                        path: new_record.path.clone(),
+                        old_checksum: existing.checksum.clone(),
+                        new_checksum: new_record.checksum.clone(),
+                        old_timestamp: existing.timestamp,
+                        new_timestamp: new_record.timestamp,
+                        old_size: existing.size,
+                        new_size: new_record.size,
+                    });
+                    total_size_change += new_record.size as i64 - existing.size as i64;
+                }
             }
-        } else {
-            println!("New file detected: {}", new_record.path);
+            None => {
+                added_files.push(new_record.clone());
+                total_size_change += new_record.size as i64;
+            }
         }
     }
 
-    Ok(())
+    // Find removed files
+    for existing_record in existing_records {
+        if !new_map.contains_key(&existing_record.path) {
+            removed_files.push(existing_record.clone());
+            total_size_change -= existing_record.size as i64;
+        }
+    }
+
+    let stats = ComparisonStats {
+        total_files_old: existing_records.len(),
+        total_files_new: new_records.len(),
+        files_added: added_files.len(),
+        files_removed: removed_files.len(),
+        files_modified: modified_files.len(),
+        total_size_change,
+    };
+
+    Ok(ComparisonResult {
+        added_files,
+        removed_files,
+        modified_files,
+        stats,
+    })
 }
 
-fn save_to_ndjson(record: &FileRecord, output: &str) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output)?;
+fn save_comparison_results(results: &ComparisonResult, output_file: &str) -> io::Result<()> {
+    let mut file = File::create(output_file)?;
+    
+    writeln!(file, "Comparison Results Summary:")?;
+    writeln!(file, "==========================")?;
+    writeln!(file, "Total files in old snapshot: {}", results.stats.total_files_old)?;
+    writeln!(file, "Total files in new snapshot: {}", results.stats.total_files_new)?;
+    writeln!(file, "Files added: {}", results.stats.files_added)?;
+    writeln!(file, "Files removed: {}", results.stats.files_removed)?;
+    writeln!(file, "Files modified: {}", results.stats.files_modified)?;
+    writeln!(file, "Total size change: {} bytes", results.stats.total_size_change)?;
+    writeln!(file)?;
 
-    let json_string = serde_json::to_string(record)?;
-    writeln!(file, "{}", json_string)?;
+    if !results.added_files.is_empty() {
+        writeln!(file, "Added Files:")?;
+        writeln!(file, "------------")?;
+        for file_record in &results.added_files {
+            writeln!(file, "  + {} ({} bytes)", file_record.path, file_record.size)?;
+        }
+        writeln!(file)?;
+    }
+
+    if !results.removed_files.is_empty() {
+        writeln!(file, "Removed Files:")?;
+        writeln!(file, "--------------")?;
+        for file_record in &results.removed_files {
+            writeln!(file, "  - {} ({} bytes)", file_record.path, file_record.size)?;
+        }
+        writeln!(file)?;
+    }
+
+    if !results.modified_files.is_empty() {
+        writeln!(file, "Modified Files:")?;
+        writeln!(file, "--------------")?;
+        for change in &results.modified_files {
+            writeln!(file, "  * {}", change.path)?;
+            writeln!(file, "    Size: {} -> {} bytes", change.old_size, change.new_size)?;
+            writeln!(file, "    Checksum: {} -> {}", change.old_checksum, change.new_checksum)?;
+            writeln!(file)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -177,6 +311,14 @@ async fn main() -> io::Result<()> {
                 .value_name("FILE")
                 .help("Compare current directory state with an existing checksum file"),
         )
+        .arg(
+            Arg::new("report")
+                .short('r')
+                .long("report")
+                .value_name("FILE")
+                .help("Output file for the comparison report (defaults to report.txt)")
+                .default_value("report.txt"),
+        )
         .get_matches();
 
     // Get values from the command-line arguments
@@ -184,6 +326,7 @@ async fn main() -> io::Result<()> {
     let output_file = matches.get_one::<String>("output").unwrap();
     let monitor_mode = matches.get_flag("monitor");
     let compare_file = matches.get_one::<String>("compare");
+    let report_file = matches.get_one::<String>("report").unwrap();
 
     if monitor_mode {
         println!("Monitoring directory: {}", directory);
@@ -198,13 +341,31 @@ async fn main() -> io::Result<()> {
             let cmp_path = Path::new(compare_path);
             if cmp_path.exists() {
                 println!("Comparing with existing file: '{}'", compare_path);
-                compare_with_existing(&cmp_path, &records)?;
+                let results = compare_with_existing(&cmp_path, &records)?;
+                
+                // Print summary to console
+                println!("\nComparison Summary:");
+                println!("==================");
+                println!("Total files in old snapshot: {}", results.stats.total_files_old);
+                println!("Total files in new snapshot: {}", results.stats.total_files_new);
+                println!("Files added: {}", results.stats.files_added);
+                println!("Files removed: {}", results.stats.files_removed);
+                println!("Files modified: {}", results.stats.files_modified);
+                println!("Total size change: {} bytes", results.stats.total_size_change);
+                
+                // Save detailed report
+                println!("\nSaving detailed report to '{}'", report_file);
+                save_comparison_results(&results, report_file)?;
             } else {
                 eprintln!("Compare file '{}' does not exist. Proceeding to write new checksums.", compare_path);
             }
         }
+
+        // Save the new checksums
+        let mut output = File::create(output_file)?;
         for record in records {
-            save_to_ndjson(&record, output_file)?;
+            let json_string = serde_json::to_string(&record)?;
+            writeln!(output, "{}", json_string)?;
         }
 
         println!("Integrity data saved to '{}'", output_file);
