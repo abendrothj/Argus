@@ -1,17 +1,19 @@
 # Argus - Directory Checksum/Monitoring Tool
 
-Argus is a simple file integrity checker built in Rust. It recursively scans a given directory, calculates the SHA-256 checksum for each file, and stores the results in a file. It supports output in NDJSON (Newline Delimited JSON) format.
+Argus is a high-performance file integrity checker built in Rust. It recursively scans a given directory, calculates the SHA-256 checksum for each file, and stores the results in NDJSON format. With support for parallel processing, ignore patterns, and real-time monitoring, it's a robust tool for tracking file changes and verifying file integrity.
 
 ## Features
 
-- Recursively scan a directory and its subdirectories
-- Calculate the SHA-256 checksum of each file
-- Output results in NDJSON format for easy processing
-- Supports command-line arguments for custom input and output paths
-- Directory monitoring mode
-- Parallel processing for faster scanning
-- Ignore patterns support (like .gitignore)
-- Detailed comparison reports
+- Fast parallel processing with configurable thread count
+- Recursive directory scanning with efficient memory usage
+- SHA-256 checksum calculation with progress tracking
+- NDJSON output format for easy data processing
+- Real-time directory monitoring with checksum updates
+- Comprehensive ignore pattern support (.gitignore and .argusignore)
+- Detailed comparison reports with size and timestamp tracking
+- Progress bar with speed and throughput metrics
+- Efficient handling of large files (up to 1GB)
+- Robust error handling and user feedback
 
 #### Coming soon:
 - Automation?
@@ -57,16 +59,16 @@ If you want to use the default directory (current working directory) and the def
 ```
 
 ### Command-Line Arguments
-- `--monitor`, `-m`: Sets monitoring mode on
-- `--directory`, `-d`: The directory to scan or monitor (defaults to the current directory if not specified)
-- `--output`, `-o`: The output file to save the checksums (checksum mode, defaults to `file_integrity.ndjson`)
-- `--compare`, `-c`: Compare current directory state with an existing checksum file
+- `--monitor`, `-m`: Enable real-time monitoring of directory changes
+- `--directory`, `-d`: Directory to scan or monitor (defaults to current directory)
+- `--output`, `-o`: Output file for checksums in NDJSON format (defaults to `file_integrity.ndjson`)
+- `--compare`, `-c`: Compare current directory state with an existing NDJSON file
 - `--report`, `-r`: Output file for the comparison report (defaults to report.txt)
-- `--threads`, `-t`: Number of threads to use for parallel processing (default: number of CPU cores)
-- `--no-ignore`: Don't use ignore patterns from .gitignore
-- `--no-git-ignore`: Don't use ignore patterns from .gitignore
-- `--help`, `-h`: Displays the help message
-- `--version`, `-V`: Display the program's version
+- `--threads`, `-t`: Number of threads for parallel processing (default: number of CPU cores)
+- `--no-ignore`: Ignore all ignore patterns (both .gitignore and .argusignore)
+- `--no-git-ignore`: Ignore only .gitignore patterns (still use .argusignore)
+- `--help`, `-h`: Display help message
+- `--version`, `-V`: Display version information
 
 ### Ignore Patterns
 
@@ -97,28 +99,45 @@ A sample `.argusignore` file is provided with common patterns. You can customize
 ### Example Usage
 
 ```bash
-# Basic scan with parallel processing
-./argus -d ./test_dir -o checksums.ndjson -t 4
+# Basic scan with 8 threads
+./argus -d ./test_dir -o checksums.ndjson -t 8
 
-# Compare with previous scan and generate report
+# Compare with previous scan and generate detailed report
 ./argus -d ./test_dir -c checksums.ndjson -r changes.txt
 
-# Monitor directory ignoring patterns in .gitignore and .argusignore
+# Monitor directory with real-time checksum updates
 ./argus -m -d /path/to/watch
 
-# Scan without using ignore patterns
+# Scan without any ignore patterns
 ./argus -d ./test_dir --no-ignore
+
+# Scan using only .argusignore (ignore .gitignore)
+./argus -d ./test_dir --no-git-ignore
 ```
+
+## Performance
+
+Argus is designed for performance:
+- Parallel processing with configurable thread count
+- Efficient buffered I/O operations
+- Memory-efficient file processing
+- Progress tracking with throughput metrics
+- Atomic operations for thread safety
 
 ## File Format
 
-The output file for checksums is in **NDJSON** format, which stores each file's checksum as a separate JSON object on a new line:
-(Absolute path is used, including character limit bypass prefix if ran on Windows)
+The output is in **NDJSON** (Newline Delimited JSON) format, with each line containing a valid JSON object:
 
 ```ndjson
 {"path": "/path/to/file1", "checksum": "abc123...", "timestamp": 1234567890, "size": 1024}
 {"path": "/path/to/file2", "checksum": "def456...", "timestamp": 1234567891, "size": 2048}
 ```
+
+Each record contains:
+- `path`: Absolute path to the file
+- `checksum`: SHA-256 hash of the file contents
+- `timestamp`: Last modification time (Unix timestamp)
+- `size`: File size in bytes
 
 ## Development
 
