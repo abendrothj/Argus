@@ -51,6 +51,12 @@ struct ComparisonStats {
     total_size_change: i64,
 }
 
+struct SaveResult {
+    successful: usize,
+    failed: usize,
+    total_bytes: u64,
+}
+
 async fn start_monitoring(directory: &str) -> notify::Result<()> {
     let (tx, mut rx) = mpsc::channel(100);
     let mut watcher = RecommendedWatcher::new(move |res| {
@@ -59,10 +65,12 @@ async fn start_monitoring(directory: &str) -> notify::Result<()> {
     watcher.watch(Path::new(directory), RecursiveMode::Recursive)?;
 
     println!("Started watching directory {}", directory);
+    println!("Press Ctrl+C to stop monitoring");
+
     while let Some(res) = rx.recv().await {
         match res {
             Ok(event) => handle_event(event),
-            Err(e) => println!("watch error: {:?}", e),
+            Err(e) => eprintln!("Watch error: {:?}", e),
         }
     }
 
@@ -70,55 +78,103 @@ async fn start_monitoring(directory: &str) -> notify::Result<()> {
 }
 
 fn handle_event(event: Event) {
-    println!("Event detected: {:?}", event);
-
     for path in &event.paths {
         match &event.kind {
             EventKind::Modify(modification) => {
                 match modification {
                     notify::event::ModifyKind::Data(_) => {
-                        println!("Data modified: {}", path.display());
-                    }
-                    notify::event::ModifyKind::Metadata(_) => {
-                        println!("Metadata modified: {}", path.display());
+                        process_file_change(path, "modified");
                     }
                     notify::event::ModifyKind::Name(_) => {
-                        println!("Name modified: {}", path.display());
+                        println!("File renamed: {}", path.display());
                     }
-                    _ => {
-                        println!("Other modification: {:?}", event);
-                    }
+                    _ => {} // Ignore other modification types
                 }
             }
             EventKind::Create(_) => {
-                println!("File created: {}", path.display());
+                process_file_change(path, "created");
             }
             EventKind::Remove(_) => {
                 println!("File removed: {}", path.display());
             }
-            EventKind::Access(_) => {
-                println!("File access: {}", path.display());
-            }
-            _ => {
-                println!("Other event detected: {:?}", event);
-            }
+            _ => {} // Ignore other event types
         }
     }
 }
 
+fn process_file_change(path: &Path, action: &str) {
+    if !path.is_file() {
+        return;
+    }
+
+    match path.metadata() {
+        Ok(metadata) => {
+            let size = metadata.len();
+            if size > MAX_FILE_SIZE {
+                eprintln!("Skipping large file {}: {} bytes", path.display(), size);
+                return;
+            }
+
+            match calculate_checksum(&path.to_string_lossy()) {
+                Ok(checksum) => {
+                    let timestamp = metadata.modified()
+                        .unwrap_or(UNIX_EPOCH)
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    println!("File {}: {}", action, path.display());
+                    println!("  Size: {} bytes", size);
+                    println!("  Timestamp: {}", timestamp);
+                    println!("  Checksum: {}", checksum);
+                }
+                Err(e) => eprintln!("Error calculating checksum for {} file {}: {}", 
+                    action, path.display(), e),
+            }
+        }
+        Err(e) => eprintln!("Error reading metadata for {} file {}: {}", 
+            action, path.display(), e),
+    }
+}
+
+const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
+const BUFFER_SIZE: usize = 1024 * 1024; // 1MB
+
 fn calculate_checksum(path: &str) -> io::Result<String> {
-    let mut file = File::open(path)?;
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    let file_size = metadata.len();
+
+    if file_size > MAX_FILE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("File size {} bytes exceeds maximum allowed size of {} bytes", 
+                file_size, MAX_FILE_SIZE)
+        ));
+    }
+
+    let mut reader = io::BufReader::with_capacity(BUFFER_SIZE, file);
     let mut hasher = Sha256::new();
-    let mut buffer = [0; 1024 * 1024]; // 1MB buffer for better performance
-    
+    let mut buffer = vec![0; BUFFER_SIZE];
+    let mut total_read = 0u64;
+
     loop {
-        let bytes_read = file.read(&mut buffer)?;
+        let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
+        total_read += bytes_read as u64;
         hasher.update(&buffer[..bytes_read]);
     }
-    
+
+    if total_read != file_size {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("File size mismatch: expected {} bytes, read {} bytes", 
+                file_size, total_read)
+        ));
+    }
+
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -136,42 +192,71 @@ fn read_ignore_file(dir: &str) -> io::Result<Vec<String>> {
     }
 }
 
-fn scan_directory(dir: &str) -> io::Result<Vec<FileRecord>> {
-    // Read .argusignore patterns
-    let ignore_patterns = read_ignore_file(dir)?;
-    
+fn scan_directory(dir: &str, no_ignore: bool, no_git_ignore: bool) -> io::Result<Vec<FileRecord>> {
     // Build walker with ignore patterns
     let mut walker = WalkBuilder::new(dir);
     walker.hidden(false); // Include hidden files by default
     
-    // Add custom ignore patterns
-    for pattern in ignore_patterns {
-        walker.add_ignore(pattern);
+    // Configure ignore patterns based on flags
+    if !no_ignore {
+        // Read and add .argusignore patterns
+        match read_ignore_file(dir) {
+            Ok(patterns) => {
+                for pattern in patterns {
+                    if let Err(e) = walker.add_ignore(pattern) {
+                        eprintln!("Warning: Invalid ignore pattern: {}", e);
+                    }
+                }
+            }
+            Err(e) => eprintln!("Warning: Failed to read .argusignore: {}", e),
+        }
+
+        // Add .gitignore if not explicitly disabled
+        if !no_git_ignore {
+            walker.git_ignore(true);
+            walker.add_custom_ignore_filename(".gitignore");
+        } else {
+            walker.git_ignore(false);
+        }
+    } else {
+        // Disable all ignore patterns
+        walker.git_ignore(false);
     }
-    
-    // Try to use .gitignore if it exists
-    walker.add_custom_ignore_filename(".gitignore");
-    walker.add_custom_ignore_filename(".argusignore");
     
     // Collect all file entries that aren't ignored
     let entries: Vec<_> = walker.build()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .filter_map(|entry| match entry {
+            Ok(entry) => {
+                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    Some(entry)
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to read entry: {}", e);
+                None
+            }
+        })
         .collect();
 
     let total_files = entries.len();
     println!("Found {} files to process (after applying ignore patterns)", total_files);
 
-    // Create a progress bar
+    // Create progress tracking structures
     let pb = ProgressBar::new(total_files as u64);
     pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({percent}%) {msg}")
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({percent}%) {binary_bytes_per_sec} ({binary_bytes}/{total_binary_bytes}) {msg}")
         .unwrap()
         .progress_chars("#>-"));
 
-    // Process files in parallel
+    let start_time = std::time::Instant::now();
+    let processed_files = std::sync::atomic::AtomicUsize::new(0);
+    let total_bytes = std::sync::atomic::AtomicU64::new(0);
+    let pb_clone = pb.clone();
+
+    // Process files in parallel with better error handling and progress tracking
     let records: Vec<FileRecord> = entries.into_par_iter()
-        .progress_with(pb.clone())
         .filter_map(|entry| {
             let path = entry.path();
             match canonicalize(path) {
@@ -180,6 +265,13 @@ fn scan_directory(dir: &str) -> io::Result<Vec<FileRecord>> {
                     
                     match entry.metadata() {
                         Ok(metadata) => {
+                            let file_size = metadata.len();
+                            // Skip files larger than 1GB
+                            if file_size > MAX_FILE_SIZE {
+                                eprintln!("Warning: Skipping large file {}: {} bytes", abs_path_str, file_size);
+                                return None;
+                            }
+
                             let timestamp = metadata.modified()
                                 .unwrap_or(UNIX_EPOCH)
                                 .duration_since(UNIX_EPOCH)
@@ -187,12 +279,22 @@ fn scan_directory(dir: &str) -> io::Result<Vec<FileRecord>> {
                                 .as_secs();
 
                             match calculate_checksum(&abs_path_str) {
-                                Ok(checksum) => Some(FileRecord {
-                                    path: abs_path_str,
-                                    checksum,
-                                    timestamp,
-                                    size: metadata.len(),
-                                }),
+                                Ok(checksum) => {
+                                    // Update progress atomically
+                                    processed_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    total_bytes.fetch_add(file_size, std::sync::atomic::Ordering::Relaxed);
+                                    
+                                    // Update progress bar
+                                    pb_clone.inc(1);
+                                    pb_clone.set_length(total_bytes.load(std::sync::atomic::Ordering::Relaxed));
+                                    
+                                    Some(FileRecord {
+                                        path: abs_path_str,
+                                        checksum,
+                                        timestamp,
+                                        size: file_size,
+                                    })
+                                }
                                 Err(e) => {
                                     eprintln!("Error calculating checksum for {}: {}", abs_path_str, e);
                                     None
@@ -213,7 +315,17 @@ fn scan_directory(dir: &str) -> io::Result<Vec<FileRecord>> {
         })
         .collect();
 
-    pb.finish_with_message("Scan complete");
+    let duration = start_time.elapsed();
+    let processed = processed_files.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes = total_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    
+    pb.finish_with_message(format!(
+        "Processed {} files ({:.2} MB) in {:.2}s ({:.2} MB/s)", 
+        processed,
+        bytes as f64 / 1024.0 / 1024.0,
+        duration.as_secs_f64(),
+        (bytes as f64 / 1024.0 / 1024.0) / duration.as_secs_f64()
+    ));
 
     Ok(records)
 }
@@ -222,17 +334,59 @@ fn compare_with_existing(file_path: &Path, new_records: &[FileRecord]) -> io::Re
     let file = File::open(file_path).map_err(|e| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("Failed to open compare file {}: {}", file_path.display(), e)
+            format!("Failed to open NDJSON file {}: {}", file_path.display(), e)
         )
     })?;
 
     let mut existing_records = Vec::new();
-    for line in io::BufReader::new(file).lines() {
-        if let Ok(record_line) = line {
-            if let Ok(record) = serde_json::from_str::<FileRecord>(&record_line) {
-                existing_records.push(record);
+    let mut parse_errors = 0;
+    let reader = io::BufReader::new(file);
+
+    for (line_num, line) in reader.lines().enumerate() {
+        match line {
+            Ok(record_line) => {
+                if record_line.trim().is_empty() {
+                    continue; // Skip empty lines
+                }
+                match serde_json::from_str::<FileRecord>(&record_line) {
+                    Ok(record) => existing_records.push(record),
+                    Err(e) => {
+                        parse_errors += 1;
+                        eprintln!(
+                            "Warning: Invalid NDJSON record at line {}: {}",
+                            line_num + 1,
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                parse_errors += 1;
+                eprintln!(
+                    "Warning: Failed to read line {} from NDJSON file: {}",
+                    line_num + 1,
+                    e
+                );
             }
         }
+    }
+
+    if existing_records.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "No valid records found in NDJSON file. Total errors: {}",
+                parse_errors
+            )
+        ));
+    }
+
+    if parse_errors > 0 {
+        eprintln!(
+            "Warning: {} errors occurred while reading NDJSON file. {} valid records found.",
+            parse_errors,
+            existing_records.len()
+        );
     }
 
     // Create maps for faster lookup
@@ -342,6 +496,65 @@ fn save_comparison_results(results: &ComparisonResult, output_file: &str) -> io:
     Ok(())
 }
 
+fn save_records_to_ndjson(records: &[FileRecord], output_file: &str) -> io::Result<SaveResult> {
+    let file = File::create(output_file)?;
+    let mut writer = io::BufWriter::new(file);
+    let mut result = SaveResult {
+        successful: 0,
+        failed: 0,
+        total_bytes: 0,
+    };
+    
+    for record in records {
+        match serde_json::to_string(record) {
+            Ok(json_string) => {
+                if json_string.contains('\n') {
+                    result.failed += 1;
+                    eprintln!(
+                        "Warning: Record for {} contains newline character (invalid in NDJSON format). Skipping.", 
+                        record.path
+                    );
+                    continue;
+                }
+
+                match writeln!(writer, "{}", json_string) {
+                    Ok(_) => {
+                        result.successful += 1;
+                        result.total_bytes += record.size;
+                    }
+                    Err(e) => {
+                        result.failed += 1;
+                        eprintln!(
+                            "Error writing record for {}: {}. Skipping.", 
+                            record.path, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                result.failed += 1;
+                eprintln!(
+                    "Error serializing record for {}: {}. Skipping.", 
+                    record.path, e
+                );
+            }
+        }
+    }
+    
+    // Ensure all data is written
+    writer.flush()?;
+
+    if result.failed > 0 {
+        eprintln!(
+            "Warning: {} records failed to save, {} records saved successfully.",
+            result.failed,
+            result.successful
+        );
+    }
+
+    Ok(result)
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // Set up command-line argument parsing using clap (4.x version)
@@ -435,7 +648,7 @@ async fn main() -> io::Result<()> {
         }
     } else {
         println!("Scanning directory: {}", directory);
-        let records = scan_directory(directory)?;
+        let records = scan_directory(directory, no_ignore, no_git_ignore)?;
 
         if let Some(compare_path) = compare_file {
             let cmp_path = Path::new(compare_path);
@@ -461,14 +674,19 @@ async fn main() -> io::Result<()> {
             }
         }
 
-        // Save the new checksums
-        let mut output = File::create(output_file)?;
-        for record in records {
-            let json_string = serde_json::to_string(&record)?;
-            writeln!(output, "{}", json_string)?;
+        // Save the new checksums with improved feedback
+        println!("Saving checksums to '{}'", output_file);
+        match save_records_to_ndjson(&records, output_file)? {
+            SaveResult { successful, failed, total_bytes } => {
+                println!("Successfully saved {} records ({:.2} MB)", 
+                    successful,
+                    total_bytes as f64 / 1024.0 / 1024.0
+                );
+                if failed > 0 {
+                    eprintln!("Failed to save {} records", failed);
+                }
+            }
         }
-
-        println!("Integrity data saved to '{}'", output_file);
     }
 
     Ok(())
