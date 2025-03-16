@@ -1,0 +1,39 @@
+# Argus ignore file
+# Lines starting with # are comments
+# Each line is a glob pattern for files/directories to ignore
+
+# Common directories to ignore
+target/
+node_modules/
+.git/
+.idea/
+.vscode/
+
+# Common file patterns to ignore
+*.log
+*.tmp
+*.temp
+*.swp
+*.bak
+*.cache
+*.pyc
+*.class
+
+# Large binary files
+*.iso
+*.zip
+*.tar
+*.gz
+*.rar
+*.7z
+*.exe
+*.dll
+*.so
+*.dylib
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Add your custom patterns below 

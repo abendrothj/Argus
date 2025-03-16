@@ -1,14 +1,17 @@
 [package]
 name = "argus"
-version = "1.0.0"
+version = "0.1.0"
 authors = ["Jake Abendroth <jake@jakea.net>"]
 edition = "2021"
 
 [dependencies]
-sha2 = "0.10"         # For SHA-256 hashing
-walkdir = "2.4"       # For recursive directory traversal
+sha2 = "0.10.8"         # For SHA-256 hashing
+walkdir = "2.4.0"       # For recursive directory traversal
 serde = { version = "1.0", features = ["derive"] }  # For JSON serialization/deserialization
 serde_json = "1.0"    # To work with JSON files
-clap = { version = "4.0", features = ["derive"] }   # Command-line options
-notify = "7.0.0"
-tokio = { version = "1.42.0", features = ["sync", "rt", "rt-multi-thread", "macros"] }
+clap = "4.4.11"
+notify = "6.1.1"
+tokio = { version = "1.35.1", features = ["full"] }
+rayon = "1.8.0"
+indicatif = { version = "0.17.7", features = ["rayon"] }
+ignore = "0.4.20"       # For gitignore-style pattern matching

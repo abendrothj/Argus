@@ -8,8 +8,11 @@ use std::path::Path;
 use clap::{Arg, ArgAction, Command};
 use tokio::sync::mpsc;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::collections::HashMap;
+use rayon::prelude::*;
+use indicatif::{ProgressBar, ProgressStyle, ParallelProgressIterator};
+use ignore::{WalkBuilder, WalkState};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct FileRecord {
@@ -106,44 +109,111 @@ fn handle_event(event: Event) {
 fn calculate_checksum(path: &str) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-    hasher.update(buffer);
+    let mut buffer = [0; 1024 * 1024]; // 1MB buffer for better performance
+    
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn scan_directory(dir: &str) -> io::Result<Vec<FileRecord>> {
-    let mut records = Vec::new();
+fn read_ignore_file(dir: &str) -> io::Result<Vec<String>> {
+    let ignore_file = Path::new(dir).join(".argusignore");
+    if ignore_file.exists() {
+        let file = File::open(ignore_file)?;
+        let reader = io::BufReader::new(file);
+        Ok(reader.lines()
+            .filter_map(|line| line.ok())
+            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+            .collect())
+    } else {
+        Ok(Vec::new())
+    }
+}
 
-    for entry in WalkDir::new(dir).follow_links(false).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_file() {
+fn scan_directory(dir: &str) -> io::Result<Vec<FileRecord>> {
+    // Read .argusignore patterns
+    let ignore_patterns = read_ignore_file(dir)?;
+    
+    // Build walker with ignore patterns
+    let mut walker = WalkBuilder::new(dir);
+    walker.hidden(false); // Include hidden files by default
+    
+    // Add custom ignore patterns
+    for pattern in ignore_patterns {
+        walker.add_ignore(pattern);
+    }
+    
+    // Try to use .gitignore if it exists
+    walker.add_custom_ignore_filename(".gitignore");
+    walker.add_custom_ignore_filename(".argusignore");
+    
+    // Collect all file entries that aren't ignored
+    let entries: Vec<_> = walker.build()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .collect();
+
+    let total_files = entries.len();
+    println!("Found {} files to process (after applying ignore patterns)", total_files);
+
+    // Create a progress bar
+    let pb = ProgressBar::new(total_files as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({percent}%) {msg}")
+        .unwrap()
+        .progress_chars("#>-"));
+
+    // Process files in parallel
+    let records: Vec<FileRecord> = entries.into_par_iter()
+        .progress_with(pb.clone())
+        .filter_map(|entry| {
+            let path = entry.path();
             match canonicalize(path) {
                 Ok(abs_path) => {
                     let abs_path_str = abs_path.to_string_lossy().to_string();
-                    println!("Processing file: {}", abs_path_str);
+                    
+                    match entry.metadata() {
+                        Ok(metadata) => {
+                            let timestamp = metadata.modified()
+                                .unwrap_or(UNIX_EPOCH)
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
 
-                    let metadata = entry.metadata()?;
-                    let timestamp = metadata.modified()
-                        .unwrap_or(UNIX_EPOCH)
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-
-                    match calculate_checksum(&abs_path_str) {
-                        Ok(checksum) => records.push(FileRecord {
-                            path: abs_path_str,
-                            checksum,
-                            timestamp,
-                            size: metadata.len(),
-                        }),
-                        Err(e) => println!("Error while processing file: {}\n{}", abs_path_str, e),
+                            match calculate_checksum(&abs_path_str) {
+                                Ok(checksum) => Some(FileRecord {
+                                    path: abs_path_str,
+                                    checksum,
+                                    timestamp,
+                                    size: metadata.len(),
+                                }),
+                                Err(e) => {
+                                    eprintln!("Error calculating checksum for {}: {}", abs_path_str, e);
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading metadata for {}: {}", abs_path_str, e);
+                            None
+                        }
                     }
                 }
-                Err(e) => eprintln!("Couldn't get absolute path for {}: {}", path.display(), e),
+                Err(e) => {
+                    eprintln!("Couldn't get absolute path for {}: {}", path.display(), e);
+                    None
+                }
             }
-        }
-    }
+        })
+        .collect();
+
+    pb.finish_with_message("Scan complete");
 
     Ok(records)
 }
@@ -319,6 +389,26 @@ async fn main() -> io::Result<()> {
                 .help("Output file for the comparison report (defaults to report.txt)")
                 .default_value("report.txt"),
         )
+        .arg(
+            Arg::new("threads")
+                .short('t')
+                .long("threads")
+                .value_name("NUM")
+                .help("Number of threads to use for parallel processing (default: number of CPU cores)")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("no-ignore")
+                .long("no-ignore")
+                .help("Don't use ignore patterns from .gitignore and .argusignore")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("no-git-ignore")
+                .long("no-git-ignore")
+                .help("Don't use ignore patterns from .gitignore")
+                .action(ArgAction::SetTrue),
+        )
         .get_matches();
 
     // Get values from the command-line arguments
@@ -327,6 +417,16 @@ async fn main() -> io::Result<()> {
     let monitor_mode = matches.get_flag("monitor");
     let compare_file = matches.get_one::<String>("compare");
     let report_file = matches.get_one::<String>("report").unwrap();
+    let no_ignore = matches.get_flag("no-ignore");
+    let no_git_ignore = matches.get_flag("no-git-ignore");
+
+    // Configure thread pool if specified
+    if let Some(thread_count) = matches.get_one::<usize>("threads") {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(*thread_count)
+            .build_global()
+            .unwrap_or_else(|e| eprintln!("Failed to set thread count: {}", e));
+    }
 
     if monitor_mode {
         println!("Monitoring directory: {}", directory);
